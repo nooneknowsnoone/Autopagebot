@@ -1,6 +1,18 @@
+require('dotenv').config(); // Add this at the very top of your file
+
 const axios = require('axios');
 const { sendMessage } = require('../handles/sendMessage');
 const memory = require('../utils/memoryManager');
+
+// Configuration - Now using environment variable
+const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = "gemini-2.5-flash";
+
+// Add validation to ensure API key exists
+if (!API_KEY) {
+    console.error('❌ GEMINI_API_KEY not found in .env file!');
+    process.exit(1);
+}
 
 function makeBold(text) {
   return text.replace(/\*\*(.+?)\*\*/g, (match, word) => {
@@ -32,9 +44,17 @@ function splitMessage(text) {
   return chunks;
 }
 
+// Function to extract image URL from message if present
+function extractImageUrl(message) {
+  // Check for common image URL patterns
+  const urlPattern = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|webp))/i;
+  const match = message.match(urlPattern);
+  return match ? match[0] : null;
+}
+
 module.exports = {
     name: ['ai'],
-    usage: 'ai [question] or ai reset or ai stats',
+    usage: 'ai [question] or ai reset',
     version: '1.0.0',
     author: 'AutoPagebot',
     category: 'ai',
@@ -42,11 +62,18 @@ module.exports = {
 
     async execute(senderId, args, pageAccessToken, event, sendMessageFunc, imageCache) {
         const message = args.join(' ');
+        const imageUrl = extractImageUrl(message);
+
+        // Clean message by removing image URL if present
+        let cleanMessage = message;
+        if (imageUrl) {
+            cleanMessage = message.replace(imageUrl, '').trim();
+        }
 
         if (!args.length) {
             const stats = memory.getStats(senderId);
             return sendMessage(senderId, { 
-                text: `🤖 𝗖𝗼𝗻𝘃𝗲𝗿𝘀𝗮𝘁𝗶𝗼𝗻𝗮𝗹 𝗔𝗜
+                text: `🤖 𝗖𝗼𝗻𝘃𝗲𝗿𝘀𝗮𝘁𝗶𝗼𝗻𝗮𝗹 𝗔𝗜 (Gemini Vision)
 
 📝 Usage: ai [your question]
 
@@ -54,6 +81,7 @@ module.exports = {
 • ai Hello! My name is John
 • ai What's my name? (remembers context)
 • ai Tell me a joke
+• ai What's in this image? https://example.com/image.jpg
 
 🔄 Commands:
 • ai reset - Clear conversation history
@@ -61,12 +89,12 @@ module.exports = {
 
 📊 Session: ${stats.messageCount} messages
 
-💡 The AI remembers your conversation!`
+💡 The AI remembers your conversation and can analyze images!`
             }, pageAccessToken);
         }
 
         // Handle reset command
-        if (message.toLowerCase() === 'reset' || message.toLowerCase() === 'clear') {
+        if (cleanMessage.toLowerCase() === 'reset' || cleanMessage.toLowerCase() === 'clear') {
             memory.clearConversation(senderId);
             return sendMessage(senderId, {
                 text: '🧹 Conversation history cleared from memory/conversations.json!\n\n💬 Start a fresh conversation.'
@@ -74,7 +102,7 @@ module.exports = {
         }
 
         // Handle stats command
-        if (message.toLowerCase() === 'stats') {
+        if (cleanMessage.toLowerCase() === 'stats') {
             const stats = memory.getStats(senderId);
             const lastActive = new Date(stats.lastActive).toLocaleString('en-PH', {
                 timeZone: 'Asia/Manila'
@@ -95,49 +123,106 @@ module.exports = {
             }, pageAccessToken);
         }
 
+        if (!cleanMessage) {
+            return sendMessage(senderId, {
+                text: '❌ Please provide a question!\n\nExample: ai What is this? https://example.com/image.jpg'
+            }, pageAccessToken);
+        }
+
         const header = '💬 | 𝗔𝗜 𝗔𝘀𝘀𝗶𝘀𝘁𝗮𝗻𝘁\n・────────────・\n';
         const footer = '\n・────────────・';
 
         // Build context from conversation history
         const context = memory.getContext(senderId, 10);
-        let prompt = message;
+
+        // Prepare conversation for Gemini
+        let conversation = [];
 
         if (context) {
-            prompt = `Previous conversation:\n${context}\nUser: ${message}\nAssistant:`;
+            // Parse previous messages from context
+            const contextLines = context.split('\n');
+            for (let i = 0; i < contextLines.length; i++) {
+                const line = contextLines[i];
+                if (line.startsWith('User: ')) {
+                    conversation.push({ role: 'user', parts: [{ text: line.substring(6) }] });
+                } else if (line.startsWith('Assistant: ')) {
+                    conversation.push({ role: 'model', parts: [{ text: line.substring(11) }] });
+                }
+            }
         }
+
+        // Build current user message with image if available
+        const parts = [{ text: cleanMessage }];
+
+        if (imageUrl) {
+            try {
+                // Fetch and convert image to base64
+                const imageResp = await axios.get(imageUrl, { 
+                    responseType: 'arraybuffer',
+                    timeout: 15000
+                });
+                const imageData = Buffer.from(imageResp.data, 'binary').toString('base64');
+                parts.push({
+                    inline_data: {
+                        mime_type: 'image/jpeg',
+                        data: imageData
+                    }
+                });
+            } catch (imageError) {
+                console.error('Image fetch error:', imageError.message);
+                await sendMessage(senderId, {
+                    text: header + '❌ Failed to fetch image from URL. Please check the URL and try again.' + footer
+                }, pageAccessToken);
+                return;
+            }
+        }
+
+        // Add current user message
+        conversation.push({ role: 'user', parts });
+
+        // Prepare payload for Gemini API
+        const payload = {
+            contents: conversation
+        };
 
         let aiResponse = null;
-        let lastError = null;
 
         try {
-            const response = await axios.get('https://kryptonite-api-library.onrender.com/api/chatgptfree', {
-                params: { 
-                    prompt: prompt,
-                    uid: senderId,
-                    model: 'chatgpt4'
-                },
-                timeout: 30000
-            });
+            const response = await axios.post(
+                `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
+                payload,
+                {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 45000
+                }
+            );
 
-            if (response.data && response.data.response) {
-                aiResponse = response.data.response;
-                console.log(`✅ API request successful - Response time: ${response.data.responseTime}`);
+            if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+                aiResponse = response.data.candidates[0].content.parts[0].text;
+                console.log(`✅ Gemini API request successful`);
+            } else {
+                throw new Error('Invalid response from Gemini API');
             }
         } catch (error) {
-            lastError = error;
-            console.log('❌ API request failed');
-        }
-
-        if (!aiResponse) {
-            console.error('AI Error:', lastError?.message);
+            console.error('Gemini API Error:', error.message);
             await sendMessage(senderId, {
                 text: header + '❌ API request failed. Please try again later.\n\n💡 Tip: The server might be busy!' + footer
             }, pageAccessToken);
             return;
         }
 
+        if (!aiResponse) {
+            await sendMessage(senderId, {
+                text: header + '❌ Failed to get response from AI. Please try again.' + footer
+            }, pageAccessToken);
+            return;
+        }
+
         // Save to conversation memory
-        memory.addMessage(senderId, 'user', message);
+        memory.addMessage(senderId, 'user', cleanMessage);
         memory.addMessage(senderId, 'assistant', aiResponse);
 
         aiResponse = aiResponse.trim();
